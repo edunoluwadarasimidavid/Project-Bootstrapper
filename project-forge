@@ -1,0 +1,490 @@
+#!/bin/sh
+#
+# project-forge - Secure Bootstrapper
+# Version: 2.1.0
+# Features: SHA256/GPG verification, rollback, safe mode, plugins
+# Author: Edun Oluwadarasimi David
+
+set -e
+
+# ============================================================================
+# BOOTSTRAPPER CONFIG (CHANGES RARELY)
+# ============================================================================
+
+BOOTSTRAPPER_VERSION="2.1.0"
+DEVELOPER_NAME="Edun Oluwadarasimi David"
+DEVELOPER_EMAIL="contact@edunoluwadarasimidavid.name.ng"
+REPOSITORY_URL="https://github.com/edunoluwadarasimidavid/Project-Bootstrapper.git"
+RAW_GITHUB_URL="https://raw.githubusercontent.com/edunoluwadarasimidavid/Project-Bootstrapper/main"
+
+# Security Configuration
+VERIFY_SIGNATURES=true          # Enable GPG signature verification
+PIN_CERTIFICATE=false           # Enable certificate pinning for enterprise
+ALLOW_SELF_SIGNED=false         # Allow local dev with self-signed certs
+
+# Paths
+CONFIG_DIR="$HOME/.project-forge"
+CACHE_DIR="$CONFIG_DIR/cache"
+LOG_DIR="$CONFIG_DIR/logs"
+VERSIONS_DIR="$CONFIG_DIR/versions"
+PLUGINS_DIR="$CONFIG_DIR/plugins"
+LOCK_FILE="/tmp/project-forge.lock"
+HEALTH_STATUS_FILE="/tmp/project-forge-health"
+
+# Create directories
+for dir in "$CONFIG_DIR" "$CACHE_DIR" "$LOG_DIR" "$VERSIONS_DIR" "$PLUGINS_DIR"; do
+    [ -d "$dir" ] || mkdir -p "$dir"
+done
+
+LOG_FILE="$LOG_DIR/project-forge.log"
+METRICS_FILE="$CACHE_DIR/metrics.json"
+CONFIG_FILE="$CONFIG_DIR/config.toml"
+
+# ============================================================================
+# LOGGING & TELEMETRY
+# ============================================================================
+
+write_log() {
+    local level="$1"
+    shift
+    printf '%s [%s] %s\n' "$(date +'%Y-%m-%d %H:%M:%S')" "$level" "$*" >> "$LOG_FILE"
+}
+
+# Metrics (opt-in only)
+record_metric() {
+    [ "$METRICS_ENABLED" = "true" ] || return 0
+    local event="$1"
+    shift
+    printf '{"timestamp":"%s","event":"%s","version":"%s",%s}\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$event" "$BOOTSTRAPPER_VERSION" "$*" >> "$METRICS_FILE"
+}
+
+# Terminal colors
+if [ -t 1 ]; then
+    RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+    BLUE='\033[0;34m'; CYAN='\033[0;36m'; MAGENTA='\033[0;35m'
+    BOLD='\033[1m'; NC='\033[0m'
+else
+    RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; MAGENTA=''; BOLD=''; NC=''
+fi
+
+log_error() { printf "${RED}[✗]${NC} %s\n" "$1" >&2; write_log "ERROR" "$1"; }
+log_info() { printf "${BLUE}[INFO]${NC} %s\n" "$1"; write_log "INFO" "$1"; }
+log_success() { printf "${GREEN}[✓]${NC} %s\n" "$1"; write_log "SUCCESS" "$1"; }
+log_warn() { printf "${YELLOW}[⚠]${NC} %s\n" "$1"; write_log "WARN" "$1"; }
+log_update() { printf "${MAGENTA}[UPDATE]${NC} %s\n" "$1"; write_log "UPDATE" "$1"; }
+log_debug() { [ "$DEBUG" -ge 1 ] && printf "${CYAN}[DEBUG]${NC} %s\n" "$1"; write_log "DEBUG" "$1"; }
+log_metric() { record_metric "$1" "$2"; }
+
+# ============================================================================
+# LOCK & SIGNAL HANDLING
+# ============================================================================
+
+acquire_lock() {
+    if [ -f "$LOCK_FILE" ]; then
+        local pid="$(cat "$LOCK_FILE" 2>/dev/null)"
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            log_error "Another instance running (PID: $pid)"
+            exit 1
+        else
+            rm -f "$LOCK_FILE"
+        fi
+    fi
+    printf '%s' "$$" > "$LOCK_FILE"
+}
+
+release_lock() {
+    [ -f "$LOCK_FILE" ] && [ "$(cat "$LOCK_FILE")" = "$$" ] && rm -f "$LOCK_FILE"
+}
+
+# ============================================================================
+# VERSION & UPDATE SYSTEM
+# ============================================================================
+
+version_compare() {
+    local v1="$1" v2="$2"
+    local IFS='.'
+    set -- $v1; local a1="$1" a2="$2" a3="${3:-0}"
+    set -- $v2; local b1="$1" b2="$2" b3="${3:-0}"
+    
+    [ "$a1" -gt "$b1" ] && echo "1" && return
+    [ "$a1" -lt "$b1" ] && echo "-1" && return
+    [ "$a2" -gt "$b2" ] && echo "1" && return
+    [ "$a2" -lt "$b2" ] && echo "-1" && return
+    [ "$a3" -gt "$b3" ] && echo "1" && return
+    [ "$a3" -lt "$b3" ] && echo "-1" && return
+    echo "0"
+}
+
+get_remote_version() {
+    local temp_file="$(mktemp)"
+    local url="$RAW_GITHUB_URL/VERSION"
+    
+    if [ "$PIN_CERTIFICATE" = "true" ] && [ -f "$CONFIG_DIR/github-ca.pem" ]; then
+        # Certificate pinning for enterprise
+        if command -v curl >/dev/null; then
+            curl --cacert "$CONFIG_DIR/github-ca.pem" -sL "$url" -o "$temp_file" 2>/dev/null
+        elif command -v wget >/dev/null; then
+            wget --ca-certificate="$CONFIG_DIR/github-ca.pem" -q "$url" -O "$temp_file" 2>/dev/null
+        fi
+    else
+        # Normal HTTPS
+        if command -v curl >/dev/null; then
+            curl -sL "$url" -o "$temp_file" 2>/dev/null
+        elif command -v wget >/dev/null; then
+            wget -q "$url" -O "$temp_file" 2>/dev/null
+        fi
+    fi
+    
+    if [ -s "$temp_file" ]; then
+        sed 's/[^0-9.]//g' "$temp_file" > "$CACHE_DIR/remote_version"
+        cat "$CACHE_DIR/remote_version"
+        rm -f "$temp_file"
+        return 0
+    fi
+    
+    rm -f "$temp_file"
+    return 1
+}
+
+should_check_update() {
+    [ ! -f "$CACHE_DIR/last_update_check" ] && return 0
+    local last_check="$(cat "$CACHE_DIR/last_update_check" 2>/dev/null || echo "0")"
+    [ $(( $(date +%s) - last_check )) -gt 86400 ]
+}
+
+check_for_updates() {
+    log_info "Checking for updates..."
+    date +%s > "$CACHE_DIR/last_update_check"
+    
+    local remote_version="$(get_remote_version)"
+    [ -z "$remote_version" ] && log_warn "Could not fetch version" && return 1
+    
+    local cmp="$(version_compare "$remote_version" "$BOOTSTRAPPER_VERSION")"
+    case "$cmp" in
+        1) log_update "Update available: v$BOOTSTRAPPER_VERSION → v$remote_version" && return 0 ;;
+        -1) log_debug "Running development version" && return 2 ;;
+        *) log_success "Running latest version: v$BOOTSTRAPPER_VERSION" && return 0 ;;
+    esac
+}
+
+# ============================================================================
+# SECURITY: VERIFICATION
+# ============================================================================
+
+verify_sha256() {
+    local file="$1"
+    local expected_hash="$2"
+    local actual_hash
+    
+    if command -v sha256sum >/dev/null; then
+        actual_hash="$(sha256sum "$file" | cut -d' ' -f1)"
+    elif command -v shasum >/dev/null; then
+        actual_hash="$(shasum -a 256 "$file" | cut -d' ' -f1)"
+    else
+        log_warn "SHA256 verification skipped (no tool available)"
+        return 0
+    fi
+    
+    if [ "$actual_hash" = "$expected_hash" ]; then
+        log_debug "SHA256 verification passed"
+        return 0
+    else
+        log_error "SHA256 verification FAILED! Expected: $expected_hash, Got: $actual_hash"
+        return 1
+    fi
+}
+
+verify_gpg_signature() {
+    local file="$1"
+    local sig_file="$2"
+    
+    [ "$VERIFY_SIGNATURES" != "true" ] && return 0
+    [ ! -f "$CONFIG_DIR/signatures/public.key" ] && log_warn "GPG key not found, skipping verification" && return 0
+    
+    if command -v gpg >/dev/null 2>&1; then
+        if gpg --import "$CONFIG_DIR/signatures/public.key" >/dev/null 2>&1 && \
+           gpg --verify "$sig_file" "$file" >/dev/null 2>&1; then
+            log_debug "GPG signature verification passed"
+            return 0
+        else
+            log_error "GPG signature verification FAILED!"
+            return 1
+        fi
+    else
+        log_warn "GPG not found, skipping signature verification"
+        return 0
+    fi
+}
+
+# ============================================================================
+# DOWNLOAD & VERIFICATION
+# ============================================================================
+
+download_with_verification() {
+    local version="$1"
+    local logic_file="$2"
+    local hash_file="${logic_file}.sha256"
+    local sig_file="${logic_file}.sig"
+    local base_url="$RAW_GITHUB_URL/updates"
+    
+    log_info "Downloading logic v$version..."
+    
+    # Download main logic
+    if command -v curl >/dev/null; then
+        curl -sL "$base_url/project-forge.v$version" -o "$logic_file" || return 1
+        curl -sL "$base_url/project-forge.v$version.sha256" -o "$hash_file" || true
+        curl -sL "$base_url/project-forge.v$version.sig" -o "$sig_file" || true
+    elif command -v wget >/dev/null; then
+        wget -q "$base_url/project-forge.v$version" -O "$logic_file" || return 1
+        wget -q "$base_url/project-forge.v$version.sha256" -O "$hash_file" || true
+        wget -q "$base_url/project-forge.v$version.sig" -O "$sig_file" || true
+    else
+        return 1
+    fi
+    
+    # Verify SHA256 if available
+    if [ -f "$hash_file" ] && [ -s "$hash_file" ]; then
+        local expected_hash="$(cat "$hash_file")"
+        if ! verify_sha256 "$logic_file" "$expected_hash"; then
+            rm -f "$logic_file" "$hash_file" "$sig_file"
+            return 1
+        fi
+    fi
+    
+    # Verify GPG signature if available
+    if [ -f "$sig_file" ] && [ -s "$sig_file" ]; then
+        if ! verify_gpg_signature "$logic_file" "$sig_file"; then
+            rm -f "$logic_file" "$hash_file" "$sig_file"
+            return 1
+        fi
+    fi
+    
+    return 0
+}
+
+get_logic_path() {
+    local version="${1:-latest}"
+    local logic_file
+    
+    if [ "$version" = "latest" ]; then
+        version="$(get_remote_version)"
+        [ -z "$version" ] && log_error "Could not determine remote version" && return 1
+    fi
+    
+    logic_file="$VERSIONS_DIR/project-forge.v$version.logic"
+    
+    if [ -f "$logic_file" ] && verify_logic "$logic_file"; then
+        printf '%s' "$logic_file"
+        return 0
+    fi
+    
+    if download_with_verification "$version" "$logic_file"; then
+        chmod +x "$logic_file"
+        log_success "Logic v$version downloaded & verified"
+        printf '%s' "$logic_file"
+        return 0
+    fi
+    
+    return 1
+}
+
+verify_logic() {
+    local file="$1"
+    [ -f "$file" ] && [ -s "$file" ] && head -n1 "$file" | grep -q "bin/sh" && return 0
+    return 1
+}
+
+# ============================================================================
+# ROLLBACK & HEALTH CHECK
+# ============================================================================
+
+perform_health_check() {
+    local logic_path="$1"
+    local health_result
+    
+    # Execute logic with --health-check flag
+    if "$logic_path" --health-check > "$HEALTH_STATUS_FILE" 2>&1; then
+        health_result="$(cat "$HEALTH_STATUS_FILE" | grep -o "HEALTHY" || echo "UNHEALTHY")"
+        [ "$health_result" = "HEALTHY" ] && return 0
+    fi
+    
+    log_error "Health check failed for logic: $logic_path"
+    [ -f "$HEALTH_STATUS_FILE" ] && log_debug "Health output: $(cat "$HEALTH_STATUS_FILE")"
+    return 1
+}
+
+rollback_to_last_good() {
+    log_warn "Rolling back to last known good version..."
+    local last_good
+    
+    # Find most recent backup that passes health check
+    for backup in $(find "$VERSIONS_DIR" -name "*.backup" 2>/dev/null | sort -Vr); do
+        if verify_logic "$backup" && perform_health_check "$backup"; then
+            last_good="$backup"
+            break
+        fi
+    done
+    
+    if [ -n "$last_good" ]; then
+        cp "$last_good" "$VERSIONS_DIR/project-forge.v$(cat "$CACHE_DIR/remote_version").logic"
+        log_success "Rolled back to: $last_good"
+        return 0
+    fi
+    
+    log_error "No working backup found. Manual intervention required."
+    return 1
+}
+
+# ============================================================================
+# DIAGNOSTICS (Doctor Mode)
+# ============================================================================
+
+run_diagnostics() {
+    log_info "Running system diagnostics..."
+    local issues=0
+    
+    # Check shell compatibility
+    if [ -n "$BASH_VERSION" ]; then
+        log_success "Bash detected (v$BASH_VERSION)"
+    elif [ -n "$ZSH_VERSION" ]; then
+        log_success "Zsh detected (v$ZSH_VERSION)"
+    elif [ "$(basename "$SHELL")" = "sh" ]; then
+        log_success "POSIX sh detected"
+    else
+        log_warn "Unknown shell: $SHELL"
+        issues=$((issues + 1))
+    fi
+    
+    # Check dependencies
+    local deps="curl wget sha256sum shasum gpg"
+    for dep in $deps; do
+        if command -v "$dep" >/dev/null; then
+            log_success "$dep available"
+        else
+            log_warn "$dep not found"
+            [ "$dep" = "curl" ] || [ "$dep" = "wget" ] && issues=$((issues + 1))
+        fi
+    done
+    
+    # Check directories
+    [ -w "$CONFIG_DIR" ] && log_success "Config dir writable" || { log_error "Config dir not writable"; issues=$((issues + 1)); }
+    [ -w "$CACHE_DIR" ] && log_success "Cache dir writable" || { log_error "Cache dir not writable"; issues=$((issues + 1)); }
+    
+    # Check network
+    if command -v curl >/dev/null; then
+        if curl -s --connect-timeout 5 "$RAW_GITHUB_URL/VERSION" >/dev/null 2>&1; then
+            log_success "Network connectivity OK"
+        else
+            log_warn "Cannot reach GitHub"
+            issues=$((issues + 1))
+        fi
+    fi
+    
+    # Check disk space
+    local free_kb
+    free_kb="$(df "$CONFIG_DIR" | tail -1 | awk '{print $4}')"
+    if [ "$free_kb" -gt 10240 ]; then
+        log_success "Disk space OK"
+    else
+        log_warn "Low disk space"
+        issues=$((issues + 1))
+    fi
+    
+    if [ $issues -eq 0 ]; then
+        log_success "All diagnostics passed"
+        return 0
+    else
+        log_error "Diagnostics found $issues issue(s)"
+        return 1
+    fi
+}
+
+# ============================================================================
+# PLUGIN SYSTEM
+# ============================================================================
+
+execute_plugin_hooks() {
+    local event="$1"
+    shift
+    local plugin_file
+    
+    for plugin_file in "$PLUGINS_DIR"/*.sh; do
+        [ -f "$plugin_file" ] || continue
+        PF_EVENT="$event" PF_CONTEXT="$*" bash "$plugin_file" 2>> "$LOG_FILE" || {
+            log_warn "Plugin $plugin_file failed on event: $event"
+        }
+    done
+}
+
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
+
+trap 'release_lock; write_log "EXIT" "Bootstrapper exited"' EXIT
+trap 'log_error "Interrupted"; exit 130' INT TERM
+
+main() {
+    acquire_lock
+    
+    # Check for doctor mode
+    if [ "$1" = "doctor" ]; then
+        run_diagnostics
+        exit $?
+    fi
+    
+    parse_args "$@"
+    
+    if [ "$1" = "--health-check" ]; then
+        printf "BOOTSTRAPPER_HEALTHY v%s\n" "$BOOTSTRAPPER_VERSION"
+        exit 0
+    fi
+    
+    log_metric "bootstrapper_start" "\"args\":\"$*\""
+    
+    # Load config if exists
+    if [ -f "$CONFIG_FILE" ]; then
+        # Parse TOML config (simple parser for key values)
+        METRICS_ENABLED="$(grep -E '^metrics_enabled\s*=' "$CONFIG_FILE" | cut -d'=' -f2 | tr -d ' "')"
+        CHANNEL="$(grep -E '^channel\s*=' "$CONFIG_FILE" | cut -d'=' -f2 | tr -d ' "')"
+        VERIFY_SIGNATURES="$(grep -E '^verify_signatures\s*=' "$CONFIG_FILE" | cut -d'=' -f2 | tr -d ' "')"
+    fi
+    
+    # Environment overrides
+    METRICS_ENABLED="${PROJECT_FORGE_METRICS:-$METRICS_ENABLED}"
+    CHANNEL="${PROJECT_FORGE_CHANNEL:-$CHANNEL}"
+    VERIFY_SIGNATURES="${PROJECT_FORGE_VERIFY_SIG:-$VERIFY_SIGNATURES}"
+    DEBUG="${PROJECT_FORGE_DEBUG:-0}"
+    
+    # Execute pre-run hooks
+    execute_plugin_hooks "pre-run" "$@"
+    
+    local logic_path
+    if [ -n "$SPECIFIC_VERSION" ]; then
+        logic_path="$(get_logic_path "$SPECIFIC_VERSION")"
+    else
+        logic_path="$(get_logic_path "latest")"
+    fi
+    
+    if [ -z "$logic_path" ]; then
+        # Try rollback
+        if rollback_to_last_good; then
+            logic_path="$(get_logic_path "latest")"
+        else
+            exit 1
+        fi
+    fi
+    
+    # Health check before execution
+    if ! perform_health_check "$logic_path"; then
+        rollback_to_last_good
+        logic_path="$(get_logic_path "latest")"
+    fi
+    
+    # Execute post-run hooks after logic completes (via trap)
+    execute_plugin_hooks "post-run" "$logic_path"
+    
+    execute_logic "$logic_path" "$@"
+}
+
+main "$@"

@@ -1,0 +1,33 @@
+# Project Forge CLI Configuration v2.1.0
+# Location: ~/.project-forge/config.toml
+
+# --- User Defaults ---
+default_author = "Edun Oluwadarasimi David"
+default_project_type = "python"
+auto_init_git = true
+
+# --- Update Settings ---
+update_channel = "stable"  # stable, beta, nightly
+check_updates = true
+auto_update = false
+
+# --- Security ---
+verify_signatures = true
+certificate_pinning = false  # Set true for enterprise
+
+# --- Telemetry (Opt-in) ---
+metrics_enabled = false  # Set true to help improve the tool
+
+# --- Debug ---
+debug_level = 0  # 0=off, 1=info, 2=debug, 3=trace
+
+# --- Plugins ---
+plugin_dir = "~/.project-forge/plugins"
+
+# --- Release Channels ---
+# To use beta channel, run: PROJECT_FORGE_CHANNEL=beta project-forge
+# To use nightly: PROJECT_FORGE_CHANNEL=nightly project-forge
+
+# --- Enterprise (System-Wide) ---
+# system_wide = false  # Set true if installed in /etc/project-forge/
+# admin_email = "admin@yourcompany.com"

@@ -1,0 +1,12 @@
+# Production/Work config
+default_author = "Company Engineering"
+auto_init_git = true
+update_channel = "stable"
+verify_signatures = true
+metrics_enabled = true  # Corporate telemetry requirement
+
+# Enterprise settings
+enterprise_mode = true
+admin_email = "devops@company.com"
+allowed_project_types = ["python", "nodejs"]  # Restrict types
+require_approval = true  # Manual approval for project creation
